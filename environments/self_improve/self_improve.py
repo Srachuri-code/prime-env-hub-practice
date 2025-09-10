@@ -35,15 +35,29 @@ class ExItBuffer:
         return len(self._items)
 
     def upsert(self, item: BufferItem) -> None:
-        if len(self._items) >= self.capacity:
-            worst_id, worst_score = None, float("inf")
-            for key, existing in self._items.items():
-                if existing.score < worst_score:
-                    worst_id, worst_score = key, existing.score
-            if item.score <= worst_score and worst_id is not None:
-                self._items.pop(worst_id, None)
-        self._items[item.instance_id] = item
-        self.prune_to_capacity()
+        # If the item already exists, update it in place
+        if item.instance_id in self._items:
+            self._items[item.instance_id] = item
+            self.prune_to_capacity()
+            return
+
+        # If we have room, insert directly
+        if len(self._items) < self.capacity:
+            self._items[item.instance_id] = item
+            return
+
+        # At capacity: only evict the current worst if the new score is strictly higher
+        worst_id, worst_score = None, float("inf")
+        for key, existing in self._items.items():
+            if existing.score < worst_score:
+                worst_id, worst_score = key, existing.score
+        if item.score > worst_score and worst_id is not None:
+            self._items.pop(worst_id, None)
+            self._items[item.instance_id] = item
+        # Otherwise, drop the new item
+
+    def remove(self, instance_id: str) -> None:
+        self._items.pop(instance_id, None)
 
     def prune_to_capacity(self) -> None:
         if len(self._items) <= self.capacity:
@@ -84,43 +98,43 @@ class ExItBuffer:
         return [x.instance_id for x in ordered[:k]]
 
 
+
+
 class GroupTracker:
-    def __init__(self):
-        self._group_returns: Dict[str, List[float]] = {}
-        self._running_stats: Dict[str, Dict[str, float]] = {}
+    def __init__(self, group_size_hint: int):
+        self.group_size_hint = max(1, int(group_size_hint))
+        # Per-instance ring buffers of most recent returns for computing contemporaneous variance
+        self._per_instance: Dict[str, List[float]] = {}
+        # Ready-to-consume variances computed when an instance accumulates group_size_hint returns
+        self._ready: Dict[str, float] = {}
 
     def begin_group(self) -> None:
-        self._group_returns = {}
+        # Do not clear accumulated per-instance returns; only reset the ready cache
+        self._ready = {}
 
     def record(self, instance_id: str, r: float) -> None:
-        if instance_id not in self._group_returns:
-            self._group_returns[instance_id] = []
-        self._group_returns[instance_id].append(float(r))
-        stats = self._running_stats.get(instance_id)
-        if stats is None:
-            stats = {"count": 0.0, "mean": 0.0, "m2": 0.0}
-            self._running_stats[instance_id] = stats
-        stats["count"] += 1.0
-        delta = r - stats["mean"]
-        stats["mean"] += delta / stats["count"]
-        delta2 = r - stats["mean"]
-        stats["m2"] += delta * delta2
+        if not instance_id:
+            return
+        lst = self._per_instance.get(instance_id)
+        if lst is None:
+            lst = []
+            self._per_instance[instance_id] = lst
+        lst.append(float(r))
+        if len(lst) >= self.group_size_hint:
+            if len(lst) >= 2:
+                mean_r = sum(lst) / len(lst)
+                var_r = sum((x - mean_r) ** 2 for x in lst) / (len(lst) - 1)
+            else:
+                var_r = 0.0
+            self._ready[instance_id] = float(var_r)
+            # Clear the buffer for the next contemporaneous group for this instance
+            self._per_instance[instance_id] = []
 
     def end_group(self) -> Dict[str, float]:
-        var_by_instance: Dict[str, float] = {}
-        for instance_id, rs in self._group_returns.items():
-            if len(rs) >= 2:
-                mean_r = sum(rs) / len(rs)
-                var_r = sum((x - mean_r) ** 2 for x in rs) / (len(rs) - 1)
-                var_by_instance[instance_id] = float(var_r)
-            else:
-                stats = self._running_stats.get(instance_id)
-                if stats and stats["count"] >= 2.0:
-                    var_by_instance[instance_id] = float(stats["m2"] / (stats["count"] - 1.0))
-                else:
-                    var_by_instance[instance_id] = 0.0
-        self._group_returns = {}
-        return var_by_instance
+        # Return any instance variances that reached the group size since last call
+        out = self._ready
+        self._ready = {}
+        return out
 
 
 class ExItController:
@@ -148,17 +162,25 @@ class ExItController:
 
     def _format_improve(self, prompt: str, prev_response: str) -> str:
         return (
-            "Improve your current response to this request:\n"
-            f"Request: {prompt}\n"
-            f"Current response: {prev_response}"
+            "Improve your current response to this request:\n\n"
+            "## Request:\n"
+            f"{prompt}\n\n"
+            "## Current response:\n"
+            f"{prev_response}"
         )
 
     def _format_diverge(self, prompt: str, prev_response: str) -> str:
         return (
-            "Consider your current response to the request. Provide a new response that significantly differs in approach and reasoning.\n"
-            "Format: summary, new approach, new response.\n"
-            f"Request: {prompt}\n"
-            f"Current response: {prev_response}"
+            "Consider your current response to this request, and provide another response that takes\n"
+            "an approach that SIGNIFICANTLY DIFFERS from the approach of the current response.\n\n"
+            "## Request:\n"
+            f"{prompt}\n\n"
+            "## Current response:\n"
+            f"{prev_response}\n\n"
+            "## Your new response format:\n"
+            "- First, provide a brief summary of the approach in the current response above.\n"
+            "- Next, state a meaningfully different approach that can be taken instead.\n"
+            "- Finally, provide your new response using this different approach."
         )
 
     def build_iter_episode(self, item: BufferItem) -> Dict[str, Any]:
@@ -199,6 +221,15 @@ class ExItController:
         prev_k = int(metadata.get("k", 0))
         next_k = prev_k + 1
         new_instance_id = f"{base_id}:k{next_k}"
+        prev_instance_id = str(metadata.get("instance_id", f"{base_id}:k{prev_k}"))
+        # Initialize expanded task score per ExIt: inherit parent's learnability score
+        parent_score = 0.0
+        if prev_instance_id:
+            existing_parent = getattr(self.buffer, "_items", {}).get(prev_instance_id)
+            if isinstance(existing_parent, BufferItem):
+                parent_score = float(existing_parent.score)
+        # Keep solved expansions but with zero learnability to naturally deprioritize
+        initial_score = 0.0 if float(base_reward) >= 1.0 else parent_score
         new_item = BufferItem(
             instance_id=new_instance_id,
             prompt=prompt,
@@ -206,7 +237,7 @@ class ExItController:
             k=next_k,
             prev_response=str(completion),
             prev_reward=float(base_reward),
-            score=0.0,
+            score=float(initial_score),
             mode=str(metadata.get("mode", "improve")),
             meta={"base_id": base_id},
         )
@@ -219,11 +250,9 @@ class ExItTrainDataset:
         self,
         base_dataset: Any,
         controller: ExItController,
-        group_tracker: GroupTracker,
     ):
         self.base_dataset = base_dataset
         self.controller = controller
-        self.group_tracker = group_tracker
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -331,7 +360,7 @@ def load_environment(
 
         rubric = vf.Rubric(
             funcs=[correct_answer_reward_func, parser.get_format_reward_func()],
-            weights=[1.0, 0.0],
+            weights=[1.0, 0.1],
         )
 
         inner_env = vf.SingleTurnEnv(
@@ -345,12 +374,10 @@ def load_environment(
 
     buffer = ExItBuffer(capacity=buffer_size, min_size=min_buffer_size, kappa=kappa)
     controller = ExItController(buffer=buffer, select_prob=select_prob, divergence_prob=divergence_prob)
-    group_tracker = GroupTracker()
+    group_tracker = GroupTracker(group_size_hint=group_size_hint)
 
-    train_dataset = ExItTrainDataset(base_dataset=dataset, controller=controller, group_tracker=group_tracker)
+    train_dataset = ExItTrainDataset(base_dataset=dataset, controller=controller)
     eval_dataset_wrapped = ExItEvalDataset(base_dataset=eval_dataset)
-
-    reward_count = {"n": 0}
 
     def exit_reward_func(parser_obj, completion, answer, **kwargs):
         response = parser_obj.parse_answer(completion) or ""
@@ -392,18 +419,11 @@ def load_environment(
 
         controller.on_episode_end(metadata_for_expansion, completion, float(r_new))
 
-        reward_count["n"] += 1
-        if reward_count["n"] % max(1, int(group_size_hint)) == 0:
-            var_by_instance = group_tracker.end_group()
-            for iid, var_r in var_by_instance.items():
-                buffer.update_score(iid, float(var_r))
-            buffer.prune_to_capacity()
-
         return out_reward
 
     rubric = vf.Rubric(
-        funcs=[exit_reward_func],
-        weights=[1.0],
+        funcs=[exit_reward_func, parser.get_format_reward_func()],
+        weights=[1.0, 0.1],
     )
 
     inner_env = vf.SingleTurnEnv(
